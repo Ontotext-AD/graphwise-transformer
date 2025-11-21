@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package graphwise_transformer;
+
+message TextWithOffsets {
+  string text = 1;
+  int32 start = 2; // inclusive character offset
+  int32 end = 3;   // exclusive character offset
+}
+
+message Embedding {
+  string string = 1;
+  repeated float embedding = 2;
+}
+
+message OffsetRequest {
+  string model_name = 1; // required
+  repeated TextWithOffsets inputs = 2; // size >= 1
+}
+
+message OffsetResponse {
+  repeated Embedding embeddings = 1; // one per input
+}
+
+message SentenceRequest {
+  string model_name = 1;
+  repeated string texts = 2;
+}
+
+message SentenceResponse {
+  repeated Embedding embeddings = 1; // one per input
+}
+
+message TokenRequest {
+  string model_name = 1;
+  repeated string texts = 2;
+}
+
+message TokenEmbeddings {
+  repeated Embedding tokens = 1; // per-token embeddings for one input text
+}
+
+message TokenResponse {
+  repeated TokenEmbeddings results = 1; // one entry per input
+}
+
+message LoadModelRequest {
+  string model_name = 1;
+}
+
+message LoadModelResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message UnloadModelRequest {
+  string model_name = 1;
+}
+
+message UnloadModelResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated string model_names = 1;
+}
+
+service InferenceService {
+  rpc EmbedWithOffsets(OffsetRequest) returns (OffsetResponse);
+  rpc EmbedSentence(SentenceRequest) returns (SentenceResponse);
+  rpc EmbedTokens(TokenRequest) returns (TokenResponse);
+}
+
+service AdminService {
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+}
