@@ -1,6 +1,6 @@
 grpcio>=1.62
 grpcio-tools>=1.62
-sentence-transformers>=3.0.1
+sentence-transformers==3.0.1
 numpy>=1.24
 protobuf>=4.25
 pytest>=7.4
