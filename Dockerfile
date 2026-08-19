@@ -69,3 +69,4 @@ USER appuser
 
 EXPOSE 5050
 ENTRYPOINT ["python", "-m", "graphwise_transformer.server"]
+
