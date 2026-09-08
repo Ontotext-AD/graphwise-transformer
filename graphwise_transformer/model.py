@@ -175,7 +175,12 @@ def _load_sentence_transformer(
     return model, resolved_precision, attention
 
 
-def _token_lengths(model, texts: tuple[str, ...]) -> list[int]:
+def _tokenize_batch(model, texts: tuple[str, ...]) -> list[list[int]]:
+    """Tokenize an item's texts once, truncated to the model's sequence limit.
+
+    The resulting ids drive the batch token budget and let the sentence path
+    report the truncated text without a second tokenizer pass.
+    """
     if not texts:
         return []
     max_length = getattr(model, "max_seq_length", None)
@@ -185,7 +190,7 @@ def _token_lengths(model, texts: tuple[str, ...]) -> list[int]:
         max_length=max_length,
         add_special_tokens=True,
     )
-    return [len(ids) for ids in encoded["input_ids"]]
+    return [_input_ids_list(ids) for ids in encoded["input_ids"]]
 
 
 def _batch_cost(lengths: list[int], *, unpadded: bool) -> int:
@@ -314,11 +319,37 @@ def _encode_token_outputs(model, texts: list[str], batch_size: int) -> list[_Tok
     return outputs
 
 
-def _postprocess_sentence(item: _WorkItem, embeddings) -> list[list[Embedding]]:
+def _sentence_strings(model, item: _WorkItem, input_ids: list[list[int]]) -> list[str]:
+    """Report only the part of each text the model actually embedded.
+
+    Texts that fit within ``max_seq_length`` are returned verbatim; longer ones
+    are decoded back from their truncated ids so responses do not echo megabytes
+    of text that never reached the encoder.
+    """
+    max_length = getattr(model, "max_seq_length", None)
+    strings: list[str] = []
+    for text, ids in zip(item.texts, input_ids):
+        if max_length is not None and len(ids) >= max_length:
+            strings.append(
+                model.tokenizer.decode(
+                    ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+            )
+        else:
+            strings.append(text)
+    return strings
+
+
+def _postprocess_sentence(
+    model, item: _WorkItem, embeddings, input_ids: list[list[int]]
+) -> list[list[Embedding]]:
+    strings = _sentence_strings(model, item, input_ids)
     return [
         [
             Embedding(
-                string=item.texts[i],
+                string=strings[i],
                 embedding=embedding.detach().float().cpu().tolist(),
             )
         ]
@@ -447,7 +478,7 @@ def _worker_main(
         )
 
         try:
-            first_lengths = _token_lengths(model, first.texts)
+            first_ids = _tokenize_batch(model, first.texts)
         except Exception as exc:
             result_queue.put(
                 _WorkResult(
@@ -458,8 +489,8 @@ def _worker_main(
             )
             continue
 
-        batch: list[tuple[_WorkItem, list[int]]] = [(first, first_lengths)]
-        all_lengths = list(first_lengths)
+        batch: list[tuple[_WorkItem, list[list[int]]]] = [(first, first_ids)]
+        all_lengths = [len(ids) for ids in first_ids]
         input_count = len(first.texts)
         deadline = time.monotonic() + max_batch_wait_ms / 1000.0
 
@@ -483,7 +514,7 @@ def _worker_main(
                 break
 
             try:
-                nxt_lengths = _token_lengths(model, nxt.texts)
+                nxt_ids = _tokenize_batch(model, nxt.texts)
             except Exception as exc:
                 result_queue.put(
                     _WorkResult(
@@ -494,7 +525,7 @@ def _worker_main(
                 )
                 continue
 
-            prospective_lengths = all_lengths + nxt_lengths
+            prospective_lengths = all_lengths + [len(ids) for ids in nxt_ids]
             prospective_inputs = input_count + len(nxt.texts)
             if (
                 batch
@@ -507,19 +538,19 @@ def _worker_main(
                 carry = nxt
                 break
 
-            batch.append((nxt, nxt_lengths))
+            batch.append((nxt, nxt_ids))
             all_lengths = prospective_lengths
             input_count = prospective_inputs
 
         flat_texts: list[str] = []
-        slices: list[tuple[_WorkItem, int, int]] = []
-        for item, _lengths in batch:
+        slices: list[tuple[_WorkItem, int, int, list[list[int]]]] = []
+        for item, item_ids in batch:
             start = len(flat_texts)
             flat_texts.extend(item.texts)
-            slices.append((item, start, len(flat_texts)))
+            slices.append((item, start, len(flat_texts), item_ids))
 
         if not flat_texts:
-            for item, _start, _end in slices:
+            for item, _start, _end, _ids in slices:
                 result_queue.put(_WorkResult(request_id=item.request_id, results=[]))
             if shutdown_after_batch:
                 break
@@ -564,7 +595,7 @@ def _worker_main(
                 exc,
                 traceback.format_exc(),
             )
-            for item, _start, _end in slices:
+            for item, _start, _end, _ids in slices:
                 result_queue.put(
                     _WorkResult(
                         request_id=item.request_id,
@@ -576,11 +607,13 @@ def _worker_main(
                 break
             continue
 
-        for item, start, end in slices:
+        for item, start, end, item_ids in slices:
             try:
                 item_outputs = outputs[start:end]
                 if _output_kind(item) == "sentence":
-                    results = _postprocess_sentence(item, item_outputs)
+                    results = _postprocess_sentence(
+                        model, item, item_outputs, item_ids
+                    )
                 else:
                     results = _postprocess_token_task(model, item, item_outputs)
                 result_queue.put(
