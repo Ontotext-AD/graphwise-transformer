@@ -1,35 +1,72 @@
 # syntax=docker/dockerfile:1
 
-FROM python:3.11-slim AS base
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+
+# Shared runtime base.
+
+FROM ${PYTHON_IMAGE} AS runtime-base
+
+ARG DEBIAN_FRONTEND=noninteractive
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    GRAPHWISE_CONFIG=/app/config.properties \
+    HF_HOME=/home/appuser/.cache/huggingface
 
 WORKDIR /app
 
-# System deps (git for sentence-transformers when resolving models, and build essentials for some wheels)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git build-essential \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only requirement files first to leverage layer caching
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy project
+COPY requirements_cpu.txt requirements_gpu.txt ./
 COPY . .
 
-# Generate gRPC stubs at build time
-RUN python setup.py build
+RUN useradd -m -u 10001 appuser \
+    && mkdir -p "${HF_HOME}" \
+    && chown -R appuser:appuser /app /home/appuser
 
-# Create non-root user
-RUN useradd -m -u 10001 appuser
+
+# CPU image
+
+FROM runtime-base AS cpu
+
+# The target is authoritative: CPU images never use CUDA workers.
+
+ENV GRAPHWISE_RUNTIME_TARGET=cpu
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -r requirements_cpu.txt \
+    && python setup.py build \
+    && python -c 'import torch, transformers, sentence_transformers; assert torch.version.cuda is None; print("torch", torch.__version__, "cpu"); print("transformers", transformers.__version__); print("sentence-transformers", sentence_transformers.__version__)'
+
+RUN chown -R appuser:appuser /app "${HF_HOME}"
 USER appuser
 
 EXPOSE 5050
-
-ENV GRAPHWISE_CONFIG=/app/config.properties
-
 ENTRYPOINT ["python", "-m", "graphwise_transformer.server"]
+
+
+# GPU image
+FROM runtime-base AS gpu
+
+# GPU images never create CPU inference workers. Overriding
+# GRAPHWISE_CPU_WORKERS to a non-zero value is rejected by configuration
+# validation at startup.
+ENV GRAPHWISE_RUNTIME_TARGET=gpu
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install -r requirements_gpu.txt \
+    && python setup.py build \
+    && python -c 'import torch, transformers, sentence_transformers, flash_attn; assert torch.version.cuda and torch.version.cuda.startswith("12."); assert torch.compiled_with_cxx11_abi(); print("torch", torch.__version__, "cuda", torch.version.cuda); print("transformers", transformers.__version__); print("sentence-transformers", sentence_transformers.__version__); print("flash-attn", flash_attn.__version__)'
+
+RUN chown -R appuser:appuser /app "${HF_HOME}"
+USER appuser
+
+EXPOSE 5050
+ENTRYPOINT ["python", "-m", "graphwise_transformer.server"]
+
