@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel", "grpcio-tools>=1.62"]
+requires = ["setuptools>=68", "wheel", "grpcio-tools==1.83.0", "protobuf==7.35.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,17 +10,19 @@ readme = "README.md"
 authors = [{name = "Tomas Kovachev", email = "tomas.kovachev@graphwise.ai"}]
 requires-python = ">=3.10"
 dependencies = [
-    "grpcio>=1.62",
-    "grpcio-tools>=1.62",
-    "sentence-transformers>=3.0.1",
-    "numpy>=1.24",
-    "protobuf>=4.25",
+    "torch==2.9.1",
+    "transformers==5.14.1",
+    "sentence-transformers==5.6.1",
+    "grpcio==1.83.0",
+    "grpcio-tools==1.83.0",
+    "numpy>=2.0,<3",
+    "protobuf==7.35.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=7.4",
-  "pytest-asyncio>=0.23",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<2",
 ]
 
 [project.scripts]
