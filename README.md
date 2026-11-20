@@ -84,18 +84,51 @@ GRAPHWISE_CONFIG=/path/to/config.properties
 
 The serving settings can also be overridden individually:
 
-| Property | Environment variable | Description |
-|---|---|---|
-| `precision` | `GRAPHWISE_PRECISION` | `auto`, `fp16`, `bf16`, or `fp32` |
-| `flash_attention` | `GRAPHWISE_FLASH_ATTENTION` | Prefer FlashAttention-2 when installed and supported |
-| `max_queue_size` | `GRAPHWISE_MAX_QUEUE_SIZE` | Maximum queued RPC work items per loaded model |
-| `max_batch_tokens` | `GRAPHWISE_MAX_BATCH_TOKENS` | Token budget used when workers combine requests |
-| `max_batch_wait_ms` | `GRAPHWISE_MAX_BATCH_WAIT_MS` | Maximum microbatch collection delay |
-| `cpu_workers` | `GRAPHWISE_CPU_WORKERS` | CPU target process count; default `1`. GPU target resolves it to `0` and rejects non-zero values |
-| `worker_start_timeout_seconds` | `GRAPHWISE_WORKER_START_TIMEOUT_SECONDS` | Maximum model-worker startup time |
-| `request_timeout_seconds` | `GRAPHWISE_REQUEST_TIMEOUT_SECONDS` | Queue/result timeout for an inference RPC |
+| Property                       | Environment variable                     | Description                                                                                      |
+|--------------------------------|------------------------------------------|--------------------------------------------------------------------------------------------------|
+| `precision`                    | `GRAPHWISE_PRECISION`                    | `auto`, `fp16`, `bf16`, or `fp32`                                                                |
+| `flash_attention`              | `GRAPHWISE_FLASH_ATTENTION`              | Prefer FlashAttention-2 when installed and supported                                             |
+| `max_queue_size`               | `GRAPHWISE_MAX_QUEUE_SIZE`               | Maximum queued RPC work items per loaded model                                                   |
+| `max_batch_tokens`             | `GRAPHWISE_MAX_BATCH_TOKENS`             | Token budget used when workers combine requests                                                  |
+| `max_batch_wait_ms`            | `GRAPHWISE_MAX_BATCH_WAIT_MS`            | Maximum microbatch collection delay                                                              |
+| `cpu_workers`                  | `GRAPHWISE_CPU_WORKERS`                  | CPU target process count; default `1`. GPU target resolves it to `0` and rejects non-zero values |
+| `worker_start_timeout_seconds` | `GRAPHWISE_WORKER_START_TIMEOUT_SECONDS` | Maximum model-worker startup time                                                                |
+| `request_timeout_seconds`      | `GRAPHWISE_REQUEST_TIMEOUT_SECONDS`      | Queue/result timeout for an inference RPC                                                        |
+| `log_level`                    | `GRAPHWISE_LOG_LEVEL`                    | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; used by the built-in logging config          |
+| `logging_config`               | `GRAPHWISE_LOGGING_CONFIG`               | Optional logging config file that replaces the built-in one (see [Logging](#logging))            |
 
 GPU worker count is intentionally not a configuration option. It is derived from the CUDA devices visible to the container.
+
+### Logging
+
+By default the server and its model workers log to stderr at `log_level` in this format:
+
+```
+2026-11-20 08:57:44,547 INFO [req-42] root: EmbedSentence: batch=2 took 35.2ms
+```
+
+The bracketed value is the request ID. Clients can send it as `x-request-id` gRPC metadata (the gRPC form of the `X-Request-ID` HTTP header); a missing or malformed ID is replaced with a generated one. The ID is echoed back in the response metadata. Lines logged outside a request show `-`, and worker lines that cover a microbatch list every request ID in it.
+
+To replace the built-in setup (format, handlers, per-logger levels), point `logging_config` at a standard Python logging config file: `.yaml`/`.yml` or `.json` in the [`dictConfig`](https://docs.python.org/3/library/logging.config.html#logging-config-dictschema) schema, or `.ini`/`.conf`/`.cfg` in the [`fileConfig`](https://docs.python.org/3/library/logging.config.html#configuration-file-format) format. The file then controls everything, including levels, so `log_level` is ignored. `%(request_id)s` can be used in any format. For example:
+
+```yaml
+version: 1
+disable_existing_loggers: false
+formatters:
+  default:
+    format: "%(asctime)s %(levelname)s [%(request_id)s] %(processName)s %(name)s: %(message)s"
+handlers:
+  console:
+    class: logging.StreamHandler
+    formatter: default
+    stream: ext://sys.stderr
+loggers:
+  httpx:
+    level: WARNING   # Hugging Face Hub logs every HTTP request at INFO
+root:
+  level: INFO
+  handlers: [console]
+```
 
 ### Precision
 
@@ -296,7 +329,7 @@ Requests from concurrent clients enter the same bounded model queue. Available w
 
 The Docker target selects both the dependency stack and the permitted worker type. Use `build.target: cpu` for CPU inference and `build.target: gpu` for CUDA inference. The CPU target defaults to one CPU worker; the GPU target sets CPU workers to zero and rejects non-zero CPU-worker configuration. Do not expose NVIDIA devices to the CPU target.
 
-The properties `port`, `log_level`, `default_model`, `max_workers`, and optional `secret` are read from `config.properties`. To provide a deployment-specific file through Compose, mount it read-only and point `GRAPHWISE_CONFIG` at it:
+The properties `port`, `log_level`, `default_model`, `max_workers`, and optional `secret` and `logging_config` are read from `config.properties`. To provide a deployment-specific file through Compose, mount it read-only and point `GRAPHWISE_CONFIG` at it:
 
 ```yaml
 services:
