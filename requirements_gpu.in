@@ -12,6 +12,7 @@ grpcio==1.83.0
 grpcio-tools==1.83.0
 numpy>=2.0,<3
 protobuf==7.35.1
+pyyaml==6.0.3
 
 # Official upstream FlashAttention 2.8.3 wheel for Linux x86_64, CPython 3.12,
 # Torch 2.9.x / CUDA 12.x / CXX11 ABI. The release asset is hash-pinned.

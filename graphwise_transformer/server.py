@@ -14,6 +14,12 @@ from .model import EmbeddingType
 from .proto import transformer_pb2 as pb  # type: ignore
 from .proto import transformer_pb2_grpc as pbg  # type: ignore
 from .registry import ModelRegistry
+from .logging_config import configure_logging
+from .request_context import (
+    REQUEST_ID_METADATA_KEY,
+    request_id_from_metadata,
+    request_id_var,
+)
 
 
 # ----------------------------
@@ -29,17 +35,23 @@ class InferenceService(pbg.InferenceServiceServicer):
         try:
             return self._registry.get(model_name)
         except KeyError as exc:
-            context.abort(grpc.StatusCode.NOT_FOUND, str(exc))
+            # str(KeyError) wraps the message in quotes; use the raw message.
+            message = str(exc.args[0]) if exc.args else f"Model not loaded: {model_name}"
+            logging.warning("NOT_FOUND: %s", message)
+            context.abort(grpc.StatusCode.NOT_FOUND, message)
 
     @staticmethod
     def _abort_inference_error(context, exc: Exception):
         if isinstance(exc, ValueError):
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
-        if isinstance(exc, TimeoutError):
-            context.abort(grpc.StatusCode.UNAVAILABLE, str(exc))
-        if isinstance(exc, RuntimeError):
-            context.abort(grpc.StatusCode.FAILED_PRECONDITION, str(exc))
-        raise exc
+            code = grpc.StatusCode.INVALID_ARGUMENT
+        elif isinstance(exc, TimeoutError):
+            code = grpc.StatusCode.UNAVAILABLE
+        elif isinstance(exc, RuntimeError):
+            code = grpc.StatusCode.FAILED_PRECONDITION
+        else:
+            raise exc
+        logging.warning("%s: %s: %s", code.name, type(exc).__name__, exc)
+        context.abort(code, str(exc))
 
     def EmbedWithOffsets(self, request: pb.OffsetRequest, context):  # noqa: N802
         t0 = time.perf_counter()
@@ -153,6 +165,9 @@ class AuthServerInterceptor(grpc.ServerInterceptor):
 
         def deny(code, message):
             def abort_handler(request, context):
+                logging.warning(
+                    "Rejected %s: %s", handler_call_details.method, message
+                )
                 context.abort(code, message)
 
             return grpc.unary_unary_rpc_method_handler(abort_handler)
@@ -192,13 +207,63 @@ class AuthServerInterceptor(grpc.ServerInterceptor):
         return continuation(handler_call_details)
 
 
+class RequestIdInterceptor(grpc.ServerInterceptor):
+    """Bind the caller's ``x-request-id`` (or a generated one) to the RPC.
+
+    ``intercept_service`` runs on gRPC's polling thread, not the thread that
+    executes the handler, so the context variable is set inside a wrapper
+    around the handler behavior. The ID is echoed back as response metadata.
+    """
+
+    def intercept_service(self, continuation, handler_call_details):
+        request_id = request_id_from_metadata(
+            handler_call_details.invocation_metadata
+        )
+        handler = continuation(handler_call_details)
+        if handler is None:
+            return None
+
+        # Every RPC in transformer.proto is unary-unary. Request-streaming
+        # handlers are wrapped too; response-streaming ones are left unchanged
+        # because a context variable cannot be held across generator yields.
+        if handler.unary_unary is not None:
+            factory = grpc.unary_unary_rpc_method_handler
+            behavior = handler.unary_unary
+        elif handler.stream_unary is not None:
+            factory = grpc.stream_unary_rpc_method_handler
+            behavior = handler.stream_unary
+        else:
+            return handler
+
+        def wrapped(request_or_iterator, context):
+            token = request_id_var.set(request_id)
+            try:
+                try:
+                    context.send_initial_metadata(
+                        ((REQUEST_ID_METADATA_KEY, request_id),)
+                    )
+                except Exception:  # pragma: no cover - echo is best effort
+                    pass
+                return behavior(request_or_iterator, context)
+            finally:
+                request_id_var.reset(token)
+
+        return factory(
+            wrapped,
+            request_deserializer=handler.request_deserializer,
+            response_serializer=handler.response_serializer,
+        )
+
+
 # ----------------------------
 # Server Setup & Lifecycle
 # ----------------------------
 
 
 def _build_server(max_workers: int, secret: str | None = None) -> grpc.Server:
-    interceptors = []
+    # RequestIdInterceptor goes first so rejected (unauthenticated) calls are
+    # logged with their request ID too.
+    interceptors: list[grpc.ServerInterceptor] = [RequestIdInterceptor()]
     if secret:
         interceptors.append(AuthServerInterceptor(secret))
         logging.info("Security enabled")
@@ -207,7 +272,7 @@ def _build_server(max_workers: int, secret: str | None = None) -> grpc.Server:
 
     return grpc.server(
         futures.ThreadPoolExecutor(max_workers=max_workers),
-        interceptors=interceptors if interceptors else None,
+        interceptors=interceptors,
     )
 
 
@@ -302,9 +367,10 @@ def serve(config: AppConfig | None = None) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    config = load_config()
+    configure_logging(config.logging)
     try:
-        serve()
+        serve(config)
     except KeyboardInterrupt:
         pass
 

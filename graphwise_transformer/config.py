@@ -1,7 +1,12 @@
 import configparser
-import logging
 import os
 from dataclasses import dataclass
+
+from .logging_config import (
+    VALID_LOG_LEVELS,
+    LoggingSettings,
+    validate_logging_config_file,
+)
 
 
 VALID_PRECISIONS = {"auto", "fp16", "bf16", "fp32"}
@@ -24,6 +29,11 @@ class AppConfig:
     runtime_target: str = "auto"
     worker_start_timeout_seconds: float = 300.0
     request_timeout_seconds: float = 300.0
+    logging_config: str | None = None
+
+    @property
+    def logging(self) -> LoggingSettings:
+        return LoggingSettings(level=self.log_level, config_file=self.logging_config)
 
 
 def _validate_choice(value: str, valid: set[str], name: str) -> str:
@@ -80,7 +90,20 @@ def load_config(config_path: str | None = None) -> AppConfig:
     values = parser["DEFAULT"]
 
     port = _positive_int(values.get("port", 5050), "port")
-    log_level = values.get("log_level", "INFO")
+    log_level = os.environ.get(
+        "GRAPHWISE_LOG_LEVEL", values.get("log_level", "INFO")
+    ).strip().upper()
+    if log_level not in VALID_LOG_LEVELS:
+        raise ValueError(
+            f"Invalid log_level '{log_level}'; expected one of {sorted(VALID_LOG_LEVELS)}"
+        )
+    logging_config = (
+        os.environ.get("GRAPHWISE_LOGGING_CONFIG", values.get("logging_config", ""))
+        .strip()
+        or None
+    )
+    if logging_config is not None:
+        validate_logging_config_file(logging_config)
     default_model = values.get(
         "default_model",
         "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
@@ -157,10 +180,6 @@ def load_config(config_path: str | None = None) -> AppConfig:
         "request_timeout_seconds",
     )
 
-    logging.getLogger().setLevel(
-        getattr(logging, log_level.upper(), logging.INFO)
-    )
-
     return AppConfig(
         port=port,
         log_level=log_level,
@@ -176,4 +195,5 @@ def load_config(config_path: str | None = None) -> AppConfig:
         runtime_target=runtime_target,
         worker_start_timeout_seconds=worker_start_timeout_seconds,
         request_timeout_seconds=request_timeout_seconds,
+        logging_config=logging_config,
     )

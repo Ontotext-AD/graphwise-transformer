@@ -12,6 +12,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from .logging_config import (
+    LoggingSettings,
+    active_logging_settings,
+    configure_logging,
+)
+from .request_context import join_request_ids, request_id_var
+
 try:
     import torch
 except Exception:  # pragma: no cover - import error is surfaced when loading a worker
@@ -36,10 +43,13 @@ class Embedding:
 
 @dataclass(frozen=True)
 class _WorkItem:
+    # Internal key that routes a worker result back to the waiting caller.
     request_id: str
     embedding_type: str
     texts: tuple[str, ...]
     char_offsets: tuple[tuple[int, int], ...] | None
+    # Client-facing X-Request-ID, used only for logging in the worker.
+    trace_id: str = "-"
 
 
 @dataclass(frozen=True)
@@ -435,10 +445,20 @@ def _worker_main(
     input_queue,
     result_queue,
     ready_queue,
+    logging_settings: LoggingSettings | None = None,
 ) -> None:
+    # Spawned processes start with no logging configuration.
+    configure_logging(logging_settings)
+    load_started = time.perf_counter()
     try:
         model, resolved_precision, attention = _load_sentence_transformer(
             model_name, device, precision, flash_attention
+        )
+        logging.info(
+            "Worker for %s on %s ready in %.1fs",
+            model_name,
+            device,
+            time.perf_counter() - load_started,
         )
         ready_queue.put(
             _WorkerReady(
@@ -480,6 +500,7 @@ def _worker_main(
         try:
             first_ids = _tokenize_batch(model, first.texts)
         except Exception as exc:
+            _log_item_failure("Tokenization", first, exc)
             result_queue.put(
                 _WorkResult(
                     request_id=first.request_id,
@@ -516,6 +537,7 @@ def _worker_main(
             try:
                 nxt_ids = _tokenize_batch(model, nxt.texts)
             except Exception as exc:
+                _log_item_failure("Tokenization", nxt, exc)
                 result_queue.put(
                     _WorkResult(
                         request_id=nxt.request_id,
@@ -542,97 +564,132 @@ def _worker_main(
             all_lengths = prospective_lengths
             input_count = prospective_inputs
 
-        flat_texts: list[str] = []
-        slices: list[tuple[_WorkItem, int, int, list[list[int]]]] = []
-        for item, item_ids in batch:
-            start = len(flat_texts)
-            flat_texts.extend(item.texts)
-            slices.append((item, start, len(flat_texts), item_ids))
-
-        if not flat_texts:
-            for item, _start, _end, _ids in slices:
-                result_queue.put(_WorkResult(request_id=item.request_id, results=[]))
-            if shutdown_after_batch:
-                break
-            continue
-
-        # If one RPC itself exceeds the token budget, split inference into
-        # conservative sub-batches. Sentence requests may use FA2 unpadding;
-        # token-level requests are intentionally budgeted as padded batches.
-        max_len = max(all_lengths) if all_lengths else 1
-        if _batch_cost(all_lengths, unpadded=batch_unpadded) <= max_batch_tokens:
-            encode_batch_size = len(flat_texts)
-        else:
-            encode_batch_size = max(1, min(len(flat_texts), max_batch_tokens // max_len))
-
+        # Log lines for the whole microbatch name every request it contains.
+        batch_token = request_id_var.set(
+            join_request_ids(item.trace_id for item, _ids in batch)
+        )
         try:
-            output_kind = _output_kind(batch[0][0])
-            if output_kind == "sentence":
-                outputs = model.encode(
-                    flat_texts,
-                    batch_size=encode_batch_size,
-                    output_value="sentence_embedding",
-                    convert_to_numpy=False,
-                    convert_to_tensor=True,
-                    normalize_embeddings=False,
-                    show_progress_bar=False,
-                )
-            else:
-                outputs = _encode_token_outputs(
-                    model, flat_texts, batch_size=encode_batch_size
-                )
-
-            if len(outputs) != len(flat_texts):
-                raise RuntimeError(
-                    "SentenceTransformer returned an unexpected number of outputs: "
-                    f"{len(outputs)} for {len(flat_texts)} inputs"
-                )
-        except Exception as exc:
-            logging.error(
-                "Inference failed for %s on %s: %s\n%s",
-                model_name,
-                device,
-                exc,
-                traceback.format_exc(),
+            _process_batch(
+                model, model_name, device, batch, all_lengths,
+                batch_unpadded, max_batch_tokens, result_queue,
             )
-            for item, _start, _end, _ids in slices:
-                result_queue.put(
-                    _WorkResult(
-                        request_id=item.request_id,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                )
-            if shutdown_after_batch:
-                break
-            continue
-
-        for item, start, end, item_ids in slices:
-            try:
-                item_outputs = outputs[start:end]
-                if _output_kind(item) == "sentence":
-                    results = _postprocess_sentence(
-                        model, item, item_outputs, item_ids
-                    )
-                else:
-                    results = _postprocess_token_task(model, item, item_outputs)
-                result_queue.put(
-                    _WorkResult(
-                        request_id=item.request_id,
-                        results=results,
-                    )
-                )
-            except Exception as exc:
-                result_queue.put(
-                    _WorkResult(
-                        request_id=item.request_id,
-                        error_type=type(exc).__name__,
-                        error_message=str(exc),
-                    )
-                )
+        finally:
+            request_id_var.reset(batch_token)
 
         if shutdown_after_batch:
             break
+
+
+def _log_item_failure(stage: str, item: _WorkItem, exc: Exception) -> None:
+    token = request_id_var.set(item.trace_id)
+    try:
+        logging.warning("%s failed: %s: %s", stage, type(exc).__name__, exc)
+    finally:
+        request_id_var.reset(token)
+
+
+def _process_batch(
+    model,
+    model_name: str,
+    device: str,
+    batch: list[tuple[_WorkItem, list[list[int]]]],
+    all_lengths: list[int],
+    batch_unpadded: bool,
+    max_batch_tokens: int,
+    result_queue,
+) -> None:
+    flat_texts: list[str] = []
+    slices: list[tuple[_WorkItem, int, int, list[list[int]]]] = []
+    for item, item_ids in batch:
+        start = len(flat_texts)
+        flat_texts.extend(item.texts)
+        slices.append((item, start, len(flat_texts), item_ids))
+
+    logging.debug(
+        "Encoding microbatch on %s: %d request(s), %d input(s)",
+        device,
+        len(batch),
+        len(flat_texts),
+    )
+
+    if not flat_texts:
+        for item, _start, _end, _ids in slices:
+            result_queue.put(_WorkResult(request_id=item.request_id, results=[]))
+        return
+
+    # If one RPC itself exceeds the token budget, split inference into
+    # conservative sub-batches. Sentence requests may use FA2 unpadding;
+    # token-level requests are intentionally budgeted as padded batches.
+    max_len = max(all_lengths) if all_lengths else 1
+    if _batch_cost(all_lengths, unpadded=batch_unpadded) <= max_batch_tokens:
+        encode_batch_size = len(flat_texts)
+    else:
+        encode_batch_size = max(1, min(len(flat_texts), max_batch_tokens // max_len))
+
+    try:
+        output_kind = _output_kind(batch[0][0])
+        if output_kind == "sentence":
+            outputs = model.encode(
+                flat_texts,
+                batch_size=encode_batch_size,
+                output_value="sentence_embedding",
+                convert_to_numpy=False,
+                convert_to_tensor=True,
+                normalize_embeddings=False,
+                show_progress_bar=False,
+            )
+        else:
+            outputs = _encode_token_outputs(
+                model, flat_texts, batch_size=encode_batch_size
+            )
+
+        if len(outputs) != len(flat_texts):
+            raise RuntimeError(
+                "SentenceTransformer returned an unexpected number of outputs: "
+                f"{len(outputs)} for {len(flat_texts)} inputs"
+            )
+    except Exception as exc:
+        logging.error(
+            "Inference failed for %s on %s: %s\n%s",
+            model_name,
+            device,
+            exc,
+            traceback.format_exc(),
+        )
+        for item, _start, _end, _ids in slices:
+            result_queue.put(
+                _WorkResult(
+                    request_id=item.request_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            )
+        return
+
+    for item, start, end, item_ids in slices:
+        try:
+            item_outputs = outputs[start:end]
+            if _output_kind(item) == "sentence":
+                results = _postprocess_sentence(
+                    model, item, item_outputs, item_ids
+                )
+            else:
+                results = _postprocess_token_task(model, item, item_outputs)
+            result_queue.put(
+                _WorkResult(
+                    request_id=item.request_id,
+                    results=results,
+                )
+            )
+        except Exception as exc:
+            _log_item_failure("Postprocessing", item, exc)
+            result_queue.put(
+                _WorkResult(
+                    request_id=item.request_id,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            )
 
 
 def _visible_worker_devices(
@@ -692,6 +749,7 @@ class EmbeddingModel:
         self._closed = False
 
         devices = _visible_worker_devices(cpu_workers, runtime_target)
+        started = time.perf_counter()
         logging.info(
             "Starting %d worker process(es) for %s on %s",
             len(devices),
@@ -711,6 +769,7 @@ class EmbeddingModel:
                     self._input_queue,
                     self._result_queue,
                     self._ready_queue,
+                    active_logging_settings(),
                 ),
                 name=f"graphwise-{device.replace(':', '-')}",
                 daemon=True,
@@ -740,6 +799,13 @@ class EmbeddingModel:
             self.unload()
             details = "; ".join(f"{x.device}: {x.error}" for x in errors)
             raise RuntimeError(f"Failed to load {self._model_name}: {details}")
+
+        logging.info(
+            "Model %s ready: %d worker(s) started in %.1fs",
+            self._model_name,
+            len(self._workers),
+            time.perf_counter() - started,
+        )
 
         self._collector = threading.Thread(
             target=self._collect_results,
@@ -800,6 +866,7 @@ class EmbeddingModel:
             embedding_type=embedding_type.value,
             texts=tuple(texts),
             char_offsets=tuple(char_offsets) if char_offsets is not None else None,
+            trace_id=request_id_var.get(),
         )
         try:
             self._input_queue.put(item, timeout=self._request_timeout_seconds)
